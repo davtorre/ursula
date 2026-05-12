@@ -1,0 +1,3 @@
+[submodule "deps/skinny-headers"]
+	path = deps/skinny-headers
+	url = https://github.com/davtorre/skinny-headers
