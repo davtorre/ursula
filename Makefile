@@ -12,7 +12,8 @@ TESTS = $(TEST_DIR)/test_csv_roundtrip \
         $(TEST_DIR)/test_match_resample_stack \
         $(TEST_DIR)/test_dynamo_assignment \
         $(TEST_DIR)/test_map \
-        $(TEST_DIR)/test_map_arr
+        $(TEST_DIR)/test_map_arr \
+        $(TEST_DIR)/test_cast
 
 .PHONY: all test clean
 
@@ -27,6 +28,7 @@ test: $(TESTS)
 	./$(TEST_DIR)/test_dynamo_assignment
 	./$(TEST_DIR)/test_map
 	./$(TEST_DIR)/test_map_arr
+	./$(TEST_DIR)/test_cast
 
 $(EXAMPLE_DIR)/example_sum: $(EXAMPLE_DIR)/example_sum.c df/skn_df.h
 	$(CC) $(CFLAGS) -I. -o $@ $< $(LDFLAGS)
@@ -55,7 +57,10 @@ $(TEST_DIR)/test_map: $(TEST_DIR)/test_map.c df/skn_df.h
 $(TEST_DIR)/test_map_arr: $(TEST_DIR)/test_map_arr.c df/skn_df.h
 	$(CC) $(CFLAGS) -I. -o $@ $< $(LDFLAGS)
 
+$(TEST_DIR)/test_cast: $(TEST_DIR)/test_cast.c df/skn_df.h
+	$(CC) $(CFLAGS) -I. -o $@ $< $(LDFLAGS)
+
 clean:
 	rm -f $(EXAMPLE_DIR)/example_sum $(TESTS)
 	rm -f test_roundtrip_out.csv test_escaping_input.csv test_escaping_out.csv
-	rm -f test_map_composition_out.csv
+	rm -f test_map_composition_out.csv test_cast_composition_out.csv

@@ -26,6 +26,7 @@
  *      df_stack_v_int/float/double/string — vertical concatenation
  *      df_map1()/df_map2()/df_map_scalar() — elementwise ops via C function pointers
  *      df_map1_arr()/df_map2_arr()/df_map_scalar_arr() — same, on raw double* arrays
+ *      df_cast_to_int()/df_cast_to_float() — explicit, opt-in narrowing cast
  *      df_print()      — print to stdout
  *      df_free()       — free memory
  */
@@ -38,6 +39,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <math.h>
+#include <limits.h>
 
 /* -------------------------------------------------------------------------
  * Configuration — override via #define before including this header
@@ -289,6 +291,36 @@ DfDoubleCol df_map2_arr(const double *a, int n_a, const double *b, int n_b,
  * as df_map1_arr. */
 DfDoubleCol df_map_scalar_arr(const double *in, int n, double scalar,
                                double (*fn)(double, double));
+
+/* Explicit, opt-in narrowing casts from DfDoubleCol (df_map1/df_map2/
+ * df_map_scalar and their _arr siblings' output shape) back to
+ * DF_INT/DF_FLOAT. Deliberately not automatic inference inside those
+ * functions — see the PM-007 brief for why a bare double(*)(double)
+ * carries no information about whether its result is
+ * meant to be integral, and why two differently-typed input columns have
+ * no single "original type" to cast back to. The caller decides.
+ *
+ * Both fail fast (df__error, same convention as df_get_*'s "column not
+ * found") on a NaN or +-Infinity element, and on the narrower type not
+ * being able to represent the (rounded, for int) result. col.count == 0
+ * doesn't crash, same allocation-guard pattern as df_map1_arr etc. */
+
+/* Rounds each element to the nearest integer via round() (round-half-
+ * away-from-zero -- chosen over rint/nearbyint specifically because those
+ * depend on the current floating-point rounding mode) before narrowing,
+ * not a truncating (int) cast. df__error fail-fast if the rounded value
+ * falls outside [INT_MIN, INT_MAX] -- a real overflow to check, not
+ * defensive-only, since a df_map_scalar result can genuinely be out of
+ * int range. */
+DfIntCol df_cast_to_int(DfDoubleCol col);
+
+/* Narrows each element to float via a plain C cast (double -> float
+ * narrowing already rounds to the nearest representable float per IEEE
+ * 754 -- no extra rounding logic needed, unlike the int case). df__error
+ * fail-fast if the resulting float is +-Infinity while the input double
+ * was finite (checked on the output, not just the input) -- that's
+ * magnitude overflow: finite but too large for float's range. */
+DfFloatCol df_cast_to_float(DfDoubleCol col);
 
 /* -------------------------------------------------------------------------
  * Implementation
@@ -1667,6 +1699,77 @@ DfDoubleCol df_map_scalar_arr(const double *in, int n, double scalar,
         out[r] = fn(in[r], scalar);
 
     DfDoubleCol result;
+    result.data  = out;
+    result.count = n;
+    return result;
+}
+
+/* ---- public: explicit narrowing cast (PM-007) ---- */
+
+DfIntCol df_cast_to_int(DfDoubleCol col)
+{
+    int n = col.count;
+    int *out = (int *)malloc((size_t)(n > 0 ? n : 1) * sizeof(int));
+    if (!out) df__error("df_cast_to_int: allocation failed");
+
+    for (int r = 0; r < n; r++) {
+        double v = col.data[r];
+        if (isnan(v) || isinf(v)) {
+            char buf[128];
+            snprintf(buf, sizeof(buf), "df_cast_to_int: element %d is %s, not castable to int",
+                     r, isnan(v) ? "NaN" : (v > 0 ? "+Infinity" : "-Infinity"));
+            free(out);
+            df__error(buf);
+        }
+
+        double rounded = round(v);
+        if (rounded < (double)INT_MIN || rounded > (double)INT_MAX) {
+            char buf[160];
+            snprintf(buf, sizeof(buf),
+                     "df_cast_to_int: element %d (%.17g, rounded %.17g) is out of int range",
+                     r, v, rounded);
+            free(out);
+            df__error(buf);
+        }
+
+        out[r] = (int)rounded;
+    }
+
+    DfIntCol result;
+    result.data  = out;
+    result.count = n;
+    return result;
+}
+
+DfFloatCol df_cast_to_float(DfDoubleCol col)
+{
+    int n = col.count;
+    float *out = (float *)malloc((size_t)(n > 0 ? n : 1) * sizeof(float));
+    if (!out) df__error("df_cast_to_float: allocation failed");
+
+    for (int r = 0; r < n; r++) {
+        double v = col.data[r];
+        if (isnan(v) || isinf(v)) {
+            char buf[128];
+            snprintf(buf, sizeof(buf), "df_cast_to_float: element %d is %s, not castable to float",
+                     r, isnan(v) ? "NaN" : (v > 0 ? "+Infinity" : "-Infinity"));
+            free(out);
+            df__error(buf);
+        }
+
+        float f = (float)v;
+        if (isinf(f)) { /* finite double, but too large in magnitude for float's range */
+            char buf[160];
+            snprintf(buf, sizeof(buf),
+                     "df_cast_to_float: element %d (%.17g) overflows float's range", r, v);
+            free(out);
+            df__error(buf);
+        }
+
+        out[r] = f;
+    }
+
+    DfFloatCol result;
     result.data  = out;
     result.count = n;
     return result;
