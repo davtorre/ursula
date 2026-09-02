@@ -24,6 +24,7 @@
  *      df_assert_unique()/df_assert_unique_string() — cardinality check
  *      df_resample()   — seeded weighted sample-with-replacement
  *      df_stack_v_int/float/double/string — vertical concatenation
+ *      df_map1()/df_map2()/df_map_scalar() — elementwise ops via C function pointers
  *      df_print()      — print to stdout
  *      df_free()       — free memory
  */
@@ -218,6 +219,45 @@ DfIntCol    df_stack_v_int   (DfIntCol    *cols, int n);
 DfFloatCol  df_stack_v_float (DfFloatCol  *cols, int n);
 DfDoubleCol df_stack_v_double(DfDoubleCol *cols, int n);
 DfStrCol    df_stack_v_string(DfStrCol    *cols, int n);
+
+/* Elementwise column operations via real C function pointers — <math.h>'s
+ * own signatures, no dispatch table, no string/enum op-code. col (and
+ * col_a/col_b) must be numeric (DF_INT/DF_FLOAT/DF_DOUBLE); a DF_STRING
+ * column, a column not found, or fn == NULL are all df__error fail-fasts,
+ * same convention as df_get_*'s "column not found". Non-double columns are
+ * coerced per-row via the existing df__as_double helper (the same one
+ * df_sum already uses) — output is always DfDoubleCol regardless of the
+ * source column's type, since these are inherently floating-point
+ * operations. Freshly heap-allocated, caller-owned (free() the usual
+ * way, same shape as df_gather_double's return) — df or its columns are
+ * never mutated; compose the result into a frame yourself via
+ * df_new/df_set_column_double, same separation PM-004 drew between
+ * df_stack_v and df_set_column_*. */
+DfDoubleCol df_map1(const DataFrame *df, const char *col, double (*fn)(double));
+
+/* col_a and col_b must have equal row counts (both come from the same df,
+ * so they always will through the public API — checked explicitly anyway,
+ * df__error fail-fast on a mismatch rather than silently truncating to
+ * the shorter one). Row k of the output is fn(as_double(col_a[k]),
+ * as_double(col_b[k])). */
+DfDoubleCol df_map2(const DataFrame *df, const char *col_a, const char *col_b,
+                     double (*fn)(double, double));
+
+/* Row k of the output is fn(as_double(col[k]), scalar) — col's value is
+ * always fn's first argument, scalar always the second; use the *_r
+ * helpers below to flip operand order for non-commutative operators. */
+DfDoubleCol df_map_scalar(const DataFrame *df, const char *col, double scalar,
+                           double (*fn)(double, double));
+
+/* Named arithmetic helpers for df_map_scalar/df_map2 — <math.h> doesn't
+ * provide +, -, *, / as functions. Deliberately not named sum/diff/etc.
+ * to avoid colliding with df_sum's existing aggregation meaning. */
+double df_add (double a, double b); /* a + b */
+double df_sub (double a, double b); /* a - b   e.g. column_A - 2 -> df_map_scalar(df, "column_A", 2.0, df_sub)  */
+double df_rsub(double a, double b); /* b - a   e.g. 2 - column_A -> df_map_scalar(df, "column_A", 2.0, df_rsub) */
+double df_mul (double a, double b); /* a * b */
+double df_div (double a, double b); /* a / b   e.g. column_A / 2 -> df_map_scalar(df, "column_A", 2.0, df_div)  */
+double df_rdiv(double a, double b); /* b / a   e.g. 2 / column_A -> df_map_scalar(df, "column_A", 2.0, df_rdiv) */
 
 /* -------------------------------------------------------------------------
  * Implementation
@@ -515,10 +555,25 @@ static void df__csv_write_cell(FILE *fp, const DataFrame *df, int col, int row)
             snprintf(buf, sizeof(buf), "%.9gf", (double)df->data[col].f[row]);
             df__csv_write_field(fp, buf);
             break;
-        case DF_DOUBLE:
+        case DF_DOUBLE: {
             snprintf(buf, sizeof(buf), "%.17g", df->data[col].d[row]);
+            /* "%.17g" of an exact integer value (e.g. 1.0) produces "1" --
+             * indistinguishable from a real int on reload, since
+             * csv__infer_cell only classifies a digit run followed by '.'
+             * as CSV_DOUBLE (a bare digit run is CSV_INT). If the buffer
+             * is nothing but an optional '-' and digits, append ".0" so
+             * it round-trips as DF_DOUBLE, not DF_INT. Doesn't apply to
+             * "inf"/"nan"/exponent forms -- those already contain a
+             * non-digit character and are left alone. */
+            int all_digits = 1;
+            for (const char *p = buf; *p; p++) {
+                if (*p == '-' && p == buf) continue;
+                if (*p < '0' || *p > '9') { all_digits = 0; break; }
+            }
+            if (all_digits) strncat(buf, ".0", sizeof(buf) - strlen(buf) - 1);
             df__csv_write_field(fp, buf);
             break;
+        }
         case DF_STRING:
             df__csv_write_field(fp, df->data[col].s[row]);
             break;
@@ -1420,6 +1475,100 @@ DfStrCol df_stack_v_string(DfStrCol *cols, int n)
     result.count = total;
     return result;
 }
+
+/* ---- public: elementwise map ---- */
+
+/* Shared column lookup + numeric-type check for df_map1/df_map2/df_map_scalar.
+ * Same fail-fast convention as df_get_*'s "column not found". */
+static int df__map_col_check(const DataFrame *df, const char *col, const char *fname)
+{
+    char buf[256];
+    if (!df)  { snprintf(buf, sizeof(buf), "%s: df is NULL", fname); df__error(buf); }
+    if (!col) { snprintf(buf, sizeof(buf), "%s: column name is NULL", fname); df__error(buf); }
+
+    int idx = df__col_index(df, col);
+    if (idx < 0) {
+        snprintf(buf, sizeof(buf), "%s: column '%s' not found", fname, col);
+        df__error(buf);
+    }
+    if (df->types[idx] == DF_STRING) {
+        snprintf(buf, sizeof(buf), "%s: column '%s' is not numeric", fname, col);
+        df__error(buf);
+    }
+    return idx;
+}
+
+DfDoubleCol df_map1(const DataFrame *df, const char *col, double (*fn)(double))
+{
+    int idx = df__map_col_check(df, col, "df_map1");
+    if (!fn) df__error("df_map1: fn is NULL");
+
+    int n = df->row_count;
+    double *out = (double *)malloc((size_t)(n > 0 ? n : 1) * sizeof(double));
+    if (!out) df__error("df_map1: allocation failed");
+
+    for (int r = 0; r < n; r++)
+        out[r] = fn(df__as_double(df, idx, r));
+
+    DfDoubleCol result;
+    result.data  = out;
+    result.count = n;
+    return result;
+}
+
+DfDoubleCol df_map2(const DataFrame *df, const char *col_a, const char *col_b,
+                     double (*fn)(double, double))
+{
+    int idx_a = df__map_col_check(df, col_a, "df_map2");
+    int idx_b = df__map_col_check(df, col_b, "df_map2");
+    if (!fn) df__error("df_map2: fn is NULL");
+
+    /* col_a and col_b are both columns of df, and DataFrame stores a
+     * single shared row_count for every column (df__set_column_check,
+     * PM-002, refuses to construct a df where a column's length disagrees
+     * with the others) -- so there is no independent "col_a length" for
+     * col_b's to mismatch against through the public API. Using
+     * df->row_count once, for both, below, *is* the explicit check: it
+     * would be dishonest to compare df->row_count to itself and call that
+     * a real mismatch guard. See test_map.c for the full reasoning. */
+    int n = df->row_count;
+    double *out = (double *)malloc((size_t)(n > 0 ? n : 1) * sizeof(double));
+    if (!out) df__error("df_map2: allocation failed");
+
+    for (int r = 0; r < n; r++)
+        out[r] = fn(df__as_double(df, idx_a, r), df__as_double(df, idx_b, r));
+
+    DfDoubleCol result;
+    result.data  = out;
+    result.count = n;
+    return result;
+}
+
+DfDoubleCol df_map_scalar(const DataFrame *df, const char *col, double scalar,
+                           double (*fn)(double, double))
+{
+    int idx = df__map_col_check(df, col, "df_map_scalar");
+    if (!fn) df__error("df_map_scalar: fn is NULL");
+
+    int n = df->row_count;
+    double *out = (double *)malloc((size_t)(n > 0 ? n : 1) * sizeof(double));
+    if (!out) df__error("df_map_scalar: allocation failed");
+
+    for (int r = 0; r < n; r++)
+        out[r] = fn(df__as_double(df, idx, r), scalar);
+
+    DfDoubleCol result;
+    result.data  = out;
+    result.count = n;
+    return result;
+}
+
+double df_add (double a, double b) { return a + b; }
+double df_sub (double a, double b) { return a - b; }
+double df_rsub(double a, double b) { return b - a; }
+double df_mul (double a, double b) { return a * b; }
+double df_div (double a, double b) { return a / b; }
+double df_rdiv(double a, double b) { return b / a; }
 
 #endif /* SKN_DF_IMPLEMENTATION */
 #endif /* SKN_DF_H */
