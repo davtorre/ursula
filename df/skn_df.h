@@ -25,6 +25,7 @@
  *      df_resample()   — seeded weighted sample-with-replacement
  *      df_stack_v_int/float/double/string — vertical concatenation
  *      df_map1()/df_map2()/df_map_scalar() — elementwise ops via C function pointers
+ *      df_map1_arr()/df_map2_arr()/df_map_scalar_arr() — same, on raw double* arrays
  *      df_print()      — print to stdout
  *      df_free()       — free memory
  */
@@ -258,6 +259,36 @@ double df_rsub(double a, double b); /* b - a   e.g. 2 - column_A -> df_map_scala
 double df_mul (double a, double b); /* a * b */
 double df_div (double a, double b); /* a / b   e.g. column_A / 2 -> df_map_scalar(df, "column_A", 2.0, df_div)  */
 double df_rdiv(double a, double b); /* b / a   e.g. 2 / column_A -> df_map_scalar(df, "column_A", 2.0, df_rdiv) */
+
+/* Array-level counterparts to df_map1/df_map2/df_map_scalar: same
+ * elementwise operation, operating on a raw double* (or a DfDoubleCol's
+ * .data/.count) instead of a (DataFrame*, column name) pair — so a map
+ * chains directly off another map's or df_gather_*'s output without a
+ * df_new/df_set_column_double/df_get_double round-trip back into
+ * DataFrame land. df_map1/df_map2/df_map_scalar are unchanged and stay
+ * implemented independently of these (see skn_df.h's PM-006 note above
+ * df_map1_arr's implementation for why). Freshly heap-allocated,
+ * caller-owned output — identical ownership shape to their DataFrame-based
+ * siblings and to df_gather_double. df_add/df_sub/df_rsub/df_mul/df_div/
+ * df_rdiv work unchanged as df_map_scalar_arr's fn. */
+
+/* out[r] = fn(in[r]) for r in [0,n). in NULL with n > 0, or fn NULL, is a
+ * df__error fail-fast (same convention as df_map1). */
+DfDoubleCol df_map1_arr(const double *in, int n, double (*fn)(double));
+
+/* n_a and n_b are taken separately, not a single shared n -- unlike
+ * df_map2's column-name version, a and b have no structural guarantee of
+ * equal length here, so n_a != n_b is a real, live df__error fail-fast,
+ * not a defensive-only formality. out[r] = fn(a[r], b[r]) for r in
+ * [0,n_a) once the lengths are confirmed equal. a/b NULL with n > 0, or
+ * fn NULL, fail fast the same way. */
+DfDoubleCol df_map2_arr(const double *a, int n_a, const double *b, int n_b,
+                         double (*fn)(double, double));
+
+/* out[r] = fn(in[r], scalar) for r in [0,n). Same NULL/fn fail-fast rules
+ * as df_map1_arr. */
+DfDoubleCol df_map_scalar_arr(const double *in, int n, double scalar,
+                               double (*fn)(double, double));
 
 /* -------------------------------------------------------------------------
  * Implementation
@@ -1569,6 +1600,77 @@ double df_rsub(double a, double b) { return b - a; }
 double df_mul (double a, double b) { return a * b; }
 double df_div (double a, double b) { return a / b; }
 double df_rdiv(double a, double b) { return b / a; }
+
+/* ---- public: array-level map (PM-006) ----
+ * Deliberately independent of df_map1/df_map2/df_map_scalar above, not
+ * implemented in terms of them or vice versa -- routing the DataFrame
+ * versions through these would mean materializing a temporary coercion
+ * buffer for DF_INT/DF_FLOAT columns for no actual benefit, and isn't
+ * worth the churn against already-shipped, already-tested code. */
+
+DfDoubleCol df_map1_arr(const double *in, int n, double (*fn)(double))
+{
+    if (n < 0) df__error("df_map1_arr: n must be >= 0");
+    if (n > 0 && !in) df__error("df_map1_arr: in is NULL");
+    if (!fn) df__error("df_map1_arr: fn is NULL");
+
+    double *out = (double *)malloc((size_t)(n > 0 ? n : 1) * sizeof(double));
+    if (!out) df__error("df_map1_arr: allocation failed");
+
+    for (int r = 0; r < n; r++)
+        out[r] = fn(in[r]);
+
+    DfDoubleCol result;
+    result.data  = out;
+    result.count = n;
+    return result;
+}
+
+DfDoubleCol df_map2_arr(const double *a, int n_a, const double *b, int n_b,
+                         double (*fn)(double, double))
+{
+    if (n_a < 0) df__error("df_map2_arr: n_a must be >= 0");
+    if (n_b < 0) df__error("df_map2_arr: n_b must be >= 0");
+    if (n_a > 0 && !a) df__error("df_map2_arr: a is NULL");
+    if (n_b > 0 && !b) df__error("df_map2_arr: b is NULL");
+    if (!fn) df__error("df_map2_arr: fn is NULL");
+    if (n_a != n_b) {
+        char buf[128];
+        snprintf(buf, sizeof(buf), "df_map2_arr: length mismatch (n_a=%d, n_b=%d)", n_a, n_b);
+        df__error(buf);
+    }
+
+    int n = n_a;
+    double *out = (double *)malloc((size_t)(n > 0 ? n : 1) * sizeof(double));
+    if (!out) df__error("df_map2_arr: allocation failed");
+
+    for (int r = 0; r < n; r++)
+        out[r] = fn(a[r], b[r]);
+
+    DfDoubleCol result;
+    result.data  = out;
+    result.count = n;
+    return result;
+}
+
+DfDoubleCol df_map_scalar_arr(const double *in, int n, double scalar,
+                               double (*fn)(double, double))
+{
+    if (n < 0) df__error("df_map_scalar_arr: n must be >= 0");
+    if (n > 0 && !in) df__error("df_map_scalar_arr: in is NULL");
+    if (!fn) df__error("df_map_scalar_arr: fn is NULL");
+
+    double *out = (double *)malloc((size_t)(n > 0 ? n : 1) * sizeof(double));
+    if (!out) df__error("df_map_scalar_arr: allocation failed");
+
+    for (int r = 0; r < n; r++)
+        out[r] = fn(in[r], scalar);
+
+    DfDoubleCol result;
+    result.data  = out;
+    result.count = n;
+    return result;
+}
 
 #endif /* SKN_DF_IMPLEMENTATION */
 #endif /* SKN_DF_H */
