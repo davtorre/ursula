@@ -149,15 +149,17 @@ static void run_assignment(const ConfGroup *groups, int n_groups,
             DfDoubleCol wv_col; wv_col.data = wv; wv_col.count = group_count.count;
 
             unsigned group_seed = seed + (unsigned)gi + 1u;
-            DfIntCol picks = df_resample(residual_col, wk_col, wv_col, group_seed);
+            DfResampleResult picks = df_resample(residual_col, wk_col, wv_col, group_seed);
 
-            for (int i = 0; i < picks.count; i++)
-                bootstrap_out[cursor_bootstrap++] = group_ftype.data[picks.data[i]];
+            for (int i = 0; i < picks.resolved_count; i++)
+                bootstrap_out[cursor_bootstrap++] = group_ftype.data[picks.picked[i]];
 
             free(residual);
             free(wk);
             free(wv);
-            free(picks.data);
+            free(picks.picked);
+            free(picks.resolved_pos);
+            free(picks.unresolved_pos);
         }
     }
 }

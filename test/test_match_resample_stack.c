@@ -123,6 +123,13 @@ static void test_match_string(void)
 
 /* ---- df_resample ---- */
 
+static void df_resample_result_free(DfResampleResult r)
+{
+    free(r.picked);
+    free(r.resolved_pos);
+    free(r.unresolved_pos);
+}
+
 static void test_resample_repeatable_and_weighted(void)
 {
     printf("\n=== df_resample: reproducible, respects zero-weight groups ===\n");
@@ -139,31 +146,71 @@ static void test_resample_repeatable_and_weighted(void)
     for (int i = 1000; i < 2000; i++) residual_data[i] = 2;    /* group 2: zero weight */
     DfIntCol residual; residual.data = residual_data; residual.count = 2000;
 
-    DfIntCol r1 = df_resample(residual, weight_key, weights, 20260812u);
-    DfIntCol r2 = df_resample(residual, weight_key, weights, 20260812u);
+    DfResampleResult r1 = df_resample(residual, weight_key, weights, 20260812u);
+    DfResampleResult r2 = df_resample(residual, weight_key, weights, 20260812u);
 
-    check(r1.count == 1000, "df_resample: zero-weight group (1000 rows) produces no output");
-    check(r1.count == r2.count &&
-          memcmp(r1.data, r2.data, (size_t)r1.count * sizeof(int)) == 0,
+    check(r1.resolved_count == 1000 && r1.unresolved_count == 1000,
+          "df_resample: zero-weight group (1000 rows) lands in unresolved_pos, not picked");
+    check(r1.resolved_count == r2.resolved_count &&
+          memcmp(r1.picked, r2.picked, (size_t)r1.resolved_count * sizeof(int)) == 0 &&
+          memcmp(r1.resolved_pos, r2.resolved_pos, (size_t)r1.resolved_count * sizeof(int)) == 0 &&
+          memcmp(r1.unresolved_pos, r2.unresolved_pos, (size_t)r1.unresolved_count * sizeof(int)) == 0,
           "df_resample: same seed and inputs -> byte-identical output across two calls");
 
+    /* partition correctness: resolved_pos/unresolved_pos together account
+     * for every input position exactly once */
+    int *seen = (int *)calloc((size_t)residual.count, sizeof(int));
+    for (int j = 0; j < r1.resolved_count; j++)   seen[r1.resolved_pos[j]]++;
+    for (int j = 0; j < r1.unresolved_count; j++) seen[r1.unresolved_pos[j]]++;
+    int partition_ok = 1;
+    for (int i = 0; i < residual.count; i++) if (seen[i] != 1) partition_ok = 0;
+    check(partition_ok, "df_resample: resolved_pos/unresolved_pos partition every input position exactly once");
+    free(seen);
+
     int all_from_group1 = 1, high_weight_hits = 0;
-    for (int i = 0; i < r1.count; i++) {
-        if (weight_key.data[r1.data[i]] != 1) all_from_group1 = 0;
-        if (r1.data[i] == 1) high_weight_hits++; /* pool row 1 has weight 99 */
+    for (int j = 0; j < r1.resolved_count; j++) {
+        if (weight_key.data[r1.picked[j]] != 1) all_from_group1 = 0;
+        if (r1.picked[j] == 1) high_weight_hits++; /* pool row 1 has weight 99 */
+        /* picked[j]/resolved_pos[j] correspondence: the group each drawn
+         * row belongs to must match the group it was drawn from */
+        if (residual.data[r1.resolved_pos[j]] != weight_key.data[r1.picked[j]]) all_from_group1 = 0;
     }
-    check(all_from_group1, "df_resample: every draw for group 1 picks a group-1 pool row");
+    check(all_from_group1, "df_resample: every draw for group 1 picks a group-1 pool row, correctly paired via resolved_pos");
     /* expect ~990/1000 with weight 99:1 -- generous bound to avoid flakiness */
     check(high_weight_hits > 900,
           "df_resample: draws are weighted (high-weight pool row picked far more often)");
 
-    DfIntCol r3 = df_resample(residual, weight_key, weights, 1u); /* different seed */
-    check(!(r1.count == r3.count && memcmp(r1.data, r3.data, (size_t)r1.count * sizeof(int)) == 0),
+    int unresolved_ok = 1;
+    for (int j = 0; j < r1.unresolved_count; j++)
+        if (residual.data[r1.unresolved_pos[j]] != 2) unresolved_ok = 0;
+    check(unresolved_ok, "df_resample: every unresolved_pos entry genuinely belongs to the zero-weight group");
+
+    DfResampleResult r3 = df_resample(residual, weight_key, weights, 1u); /* different seed */
+    check(!(r1.resolved_count == r3.resolved_count &&
+            memcmp(r1.picked, r3.picked, (size_t)r1.resolved_count * sizeof(int)) == 0),
           "df_resample: a different seed produces a different draw sequence");
 
-    free(r1.data);
-    free(r2.data);
-    free(r3.data);
+    df_resample_result_free(r1);
+    df_resample_result_free(r2);
+    df_resample_result_free(r3);
+}
+
+static void test_resample_zero_count(void)
+{
+    printf("\n=== df_resample: residual_idx.count == 0 ===\n");
+
+    int    wk_data[1] = {1};
+    double  w_data[1] = {1.0};
+    DfIntCol weight_key; weight_key.data = wk_data; weight_key.count = 1;
+    DfDoubleCol weights;  weights.data   = w_data;  weights.count   = 1;
+
+    DfIntCol residual; residual.data = NULL; residual.count = 0;
+
+    DfResampleResult r = df_resample(residual, weight_key, weights, 1u);
+    check(r.resolved_count == 0 && r.unresolved_count == 0,
+          "df_resample: residual_idx.count == 0 -> all-empty result, no crash");
+
+    df_resample_result_free(r);
 }
 
 /* ---- df_stack_v_* ---- */
@@ -209,6 +256,7 @@ int main(void)
     test_match_fail_fast();
     test_match_string();
     test_resample_repeatable_and_weighted();
+    test_resample_zero_count();
     test_stack_v();
 
     printf("\n%s\n", all_ok ? "All match/resample/stack tests PASS" : "SOME TESTS FAILED");
