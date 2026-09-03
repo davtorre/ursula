@@ -22,7 +22,7 @@
  *      df_gather_int/float/double/string — select/reorder a column's rows by index
  *      df_match()/df_match_string() — deterministic m:1/1:1 equi-join
  *      df_assert_unique()/df_assert_unique_string() — cardinality check
- *      df_resample()   — seeded weighted sample-with-replacement
+ *      df_resample()/df_resample_string() — seeded weighted sample-with-replacement
  *      df_stack_v_int/float/double/string — vertical concatenation
  *      df_map1()/df_map2()/df_map_scalar() — elementwise ops via C function pointers
  *      df_map1_arr()/df_map2_arr()/df_map_scalar_arr() — same, on raw double* arrays
@@ -229,6 +229,18 @@ void df_assert_unique_string(DfStrCol key);
  * pool or retry at a coarser key, the caller does (thread the gap into a
  * second df_resample call against a coarser group key). */
 DfIntCol df_resample(DfIntCol residual_idx, DfIntCol weight_key, DfDoubleCol weights, unsigned seed);
+
+/* String-keyed sibling of df_resample: identical contract, DfStrCol in
+ * place of DfIntCol for residual_idx/weight_key only -- weights stays
+ * DfDoubleCol and the return type stays DfIntCol (a pool position is a
+ * position regardless of what type the key itself is, same reasoning
+ * df_match_string already applies to its own return type). Group
+ * membership is decided by string equality (strcmp), not pointer identity
+ * -- same convention df_match_string/df_assert_unique_string already use.
+ * Same draw-once-per-residual-row-regardless-of-zero-weight-group ordering
+ * guarantee, same "zero-weight group produces no output" behavior, same
+ * seeded/reproducible bar as df_resample. */
+DfIntCol df_resample_string(DfStrCol residual_idx, DfStrCol weight_key, DfDoubleCol weights, unsigned seed);
 
 /* Vertical concatenation: n same-typed columns end to end, in argument
  * order, into one output column of their combined length. Not the same
@@ -1460,7 +1472,7 @@ void df_assert_unique_string(DfStrCol key)
     free(next);
 }
 
-/* ---- public: resample ---- */
+/* ---- public: resample / resample_string ---- */
 
 DfIntCol df_resample(DfIntCol residual_idx, DfIntCol weight_key, DfDoubleCol weights, unsigned seed)
 {
@@ -1525,6 +1537,82 @@ DfIntCol df_resample(DfIntCol residual_idx, DfIntCol weight_key, DfDoubleCol wei
              * dropping a draw that should have counted. */
             for (int j = bucket_head[b]; j != -1; j = next[j])
                 if (weight_key.data[j] == g) picked = j;
+        }
+        out[out_count++] = picked;
+    }
+
+    free(bucket_head);
+    free(next);
+
+    DfIntCol result;
+    result.data  = out;
+    result.count = out_count;
+    return result;
+}
+
+DfIntCol df_resample_string(DfStrCol residual_idx, DfStrCol weight_key, DfDoubleCol weights, unsigned seed)
+{
+    if (weight_key.count != weights.count)
+        df__error("df_resample_string: weight_key.count and weights.count must match");
+
+    int wn = weight_key.count;
+    size_t cap = df__next_pow2((size_t)(wn > 0 ? wn : 1));
+    size_t mask = cap - 1;
+
+    int *bucket_head = (int *)malloc(cap * sizeof(int));
+    int *next        = (int *)malloc((size_t)(wn > 0 ? wn : 1) * sizeof(int));
+    if (!bucket_head || !next) {
+        free(bucket_head); free(next);
+        df__error("df_resample_string: allocation failed");
+    }
+    for (size_t b = 0; b < cap; b++) bucket_head[b] = -1;
+    for (int j = 0; j < wn; j++) {
+        size_t b = (size_t)df__hash_str(weight_key.data[j]) & mask;
+        next[j] = bucket_head[b];
+        bucket_head[b] = j;
+    }
+
+    int n = residual_idx.count;
+    int *out = (int *)malloc((size_t)(n > 0 ? n : 1) * sizeof(int));
+    if (!out) {
+        free(bucket_head); free(next);
+        df__error("df_resample_string: allocation failed");
+    }
+
+    /* Mix the seed through splitmix64 once up front so seed=0 and
+     * seed=1 don't start from adjacent, visibly-correlated states. */
+    uint64_t rng_state = (uint64_t)seed;
+    (void)df__splitmix64_next(&rng_state);
+
+    int out_count = 0;
+    for (int k = 0; k < n; k++) {
+        const char *g = residual_idx.data[k];
+        size_t b = (size_t)df__hash_str(g) & mask;
+
+        double total = 0.0;
+        for (int j = bucket_head[b]; j != -1; j = next[j])
+            if (strcmp(weight_key.data[j], g) == 0) total += weights.data[j];
+
+        /* Draw once per residual row regardless of total weight, so a
+         * later row's draw never shifts depending on how many earlier
+         * rows happened to land in a zero-weight group. */
+        double r = df__rand_uniform(&rng_state) * total;
+
+        if (total <= 0.0) continue; /* no output for this row -- caller's job to retry at a coarser key */
+
+        double cum = 0.0;
+        int picked = -1;
+        for (int j = bucket_head[b]; j != -1; j = next[j]) {
+            if (strcmp(weight_key.data[j], g) != 0) continue;
+            cum += weights.data[j];
+            if (r < cum) { picked = j; break; }
+        }
+        if (picked < 0) {
+            /* r landed exactly on (or past, by rounding) the cumulative
+             * total -- fall back to the group's last pool row rather than
+             * dropping a draw that should have counted. */
+            for (int j = bucket_head[b]; j != -1; j = next[j])
+                if (strcmp(weight_key.data[j], g) == 0) picked = j;
         }
         out[out_count++] = picked;
     }
