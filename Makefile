@@ -13,7 +13,8 @@ TESTS = $(TEST_DIR)/test_csv_roundtrip \
         $(TEST_DIR)/test_dynamo_assignment \
         $(TEST_DIR)/test_map \
         $(TEST_DIR)/test_map_arr \
-        $(TEST_DIR)/test_cast
+        $(TEST_DIR)/test_cast \
+        $(TEST_DIR)/test_shuffle_pair
 
 .PHONY: all test clean
 
@@ -29,6 +30,7 @@ test: $(TESTS)
 	./$(TEST_DIR)/test_map
 	./$(TEST_DIR)/test_map_arr
 	./$(TEST_DIR)/test_cast
+	./$(TEST_DIR)/test_shuffle_pair
 
 $(EXAMPLE_DIR)/example_sum: $(EXAMPLE_DIR)/example_sum.c df/skn_df.h
 	$(CC) $(CFLAGS) -I. -o $@ $< $(LDFLAGS)
@@ -58,6 +60,9 @@ $(TEST_DIR)/test_map_arr: $(TEST_DIR)/test_map_arr.c df/skn_df.h
 	$(CC) $(CFLAGS) -I. -o $@ $< $(LDFLAGS)
 
 $(TEST_DIR)/test_cast: $(TEST_DIR)/test_cast.c df/skn_df.h
+	$(CC) $(CFLAGS) -I. -o $@ $< $(LDFLAGS)
+
+$(TEST_DIR)/test_shuffle_pair: $(TEST_DIR)/test_shuffle_pair.c df/skn_df.h
 	$(CC) $(CFLAGS) -I. -o $@ $< $(LDFLAGS)
 
 clean:

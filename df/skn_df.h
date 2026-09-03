@@ -27,6 +27,8 @@
  *      df_map1()/df_map2()/df_map_scalar() — elementwise ops via C function pointers
  *      df_map1_arr()/df_map2_arr()/df_map_scalar_arr() — same, on raw double* arrays
  *      df_cast_to_int()/df_cast_to_float() — explicit, opt-in narrowing cast
+ *      df_shuffle_within_groups()/_string() — seeded, group-boundary-preserving shuffle
+ *      df_pair()/df_pair_string() — merge-style within-group positional pairing
  *      df_print()      — print to stdout
  *      df_free()       — free memory
  */
@@ -98,6 +100,22 @@ typedef struct {
  * rather than implied so match results compose the same way df_gather_*'s
  * index arrays do. */
 typedef struct { int *left_idx; int *right_idx; int count; } DfMatchResult;
+
+/* Result of df_pair/df_pair_string: original-frame row indices, split into
+ * matched pairs and demand-side leftovers. demand_idx[k]/supply_idx[k]
+ * share a key value, for every k in [0, matched_count). residual_idx holds
+ * every demand row df_pair couldn't pair (including a whole demand group
+ * absent from supply). What happens to residual_idx next — retry at a
+ * coarser key, df_resample it, or treat it as a terminal gap — is the
+ * caller's decision, same boundary df_resample's own residual already
+ * drew. */
+typedef struct {
+    int *demand_idx;
+    int *supply_idx;
+    int  matched_count;
+    int *residual_idx;
+    int  residual_count;
+} DfPairResult;
 
 /* -------------------------------------------------------------------------
  * Public API
@@ -322,6 +340,45 @@ DfIntCol df_cast_to_int(DfDoubleCol col);
  * magnitude overflow: finite but too large for float's range. */
 DfFloatCol df_cast_to_float(DfDoubleCol col);
 
+/* Within-group shuffle: sorted_idx/sorted_key must be df_sort's output and
+ * the group-key column gathered through it (df_gather_int/df_gather_string
+ * on sorted_idx) — both length n; sorted_key.count != n is a df__error
+ * fail-fast. Scans sorted_key once for contiguous runs of equal value
+ * (cheap: it's already sorted, a run boundary is just "value differs from
+ * the previous element") and applies an independent seeded Fisher-Yates
+ * permutation to each run's slice of sorted_idx's *positions* — values in
+ * sorted_idx are never altered, only reordered within their own run, so
+ * group boundaries never move. Seeded and reproducible: two calls with
+ * the same seed and inputs are byte-identical, same determinism bar
+ * df_sort/df_resample already established. Returns a freshly
+ * heap-allocated int* of length n, caller-owned (free() the usual way);
+ * n == 0 doesn't crash. */
+int *df_shuffle_within_groups       (const int *sorted_idx, DfIntCol sorted_key, int n, unsigned seed);
+int *df_shuffle_within_groups_string(const int *sorted_idx, DfStrCol sorted_key, int n, unsigned seed);
+
+/* Merge-style two-pointer pairing: demand_idx/demand_key and
+ * supply_idx/supply_key are each expected to already be
+ * grouped-and-shuffled-within-group (df_sort -> df_gather_* ->
+ * df_shuffle_within_groups -> df_gather_* again with the shuffled index)
+ * — df_pair does not re-sort or re-shuffle anything itself, it trusts its
+ * inputs are already in that shape. Because both key arrays are
+ * independently sorted by the same key ordering, distinct group values
+ * appear in the same relative order on both sides, so a single
+ * merge-style scan (no hashing) finds each demand run's matching supply
+ * run. Per matching group, takes min(demand_run_len, supply_run_len)
+ * pairs from the *start* of each run — within-run order is already
+ * randomized by df_shuffle_within_groups, so "start of run" is exactly as
+ * random as any other position. Any demand-run remainder (including a
+ * whole demand run absent from supply) becomes residual_idx. Deciding
+ * what happens to residual_idx next is not this function's job — same
+ * boundary df_resample's own residual already drew. n_demand == 0 yields
+ * an entirely empty result; n_supply == 0 sends all of demand_idx to
+ * residual_idx. Output arrays are caller-owned, freed individually. */
+DfPairResult df_pair       (const int *demand_idx, DfIntCol demand_key, int n_demand,
+                             const int *supply_idx, DfIntCol supply_key, int n_supply);
+DfPairResult df_pair_string(const int *demand_idx, DfStrCol demand_key, int n_demand,
+                             const int *supply_idx, DfStrCol supply_key, int n_supply);
+
 /* -------------------------------------------------------------------------
  * Implementation
  * ---------------------------------------------------------------------- */
@@ -480,6 +537,18 @@ static double df__rand_uniform(uint64_t *state)
 {
     uint64_t r = df__splitmix64_next(state);
     return (double)(r >> 11) * (1.0 / 9007199254740992.0); /* / 2^53 */
+}
+
+/* In-place Fisher-Yates shuffle of arr[lo, hi), seeded via *state.
+ * Used by df_shuffle_within_groups(_string) to permute one run at a time. */
+static void df__fisher_yates(int *arr, int lo, int hi, uint64_t *state)
+{
+    for (int i = hi - 1; i > lo; i--) {
+        int range = i - lo + 1;
+        int j = lo + (int)(df__rand_uniform(state) * (double)range);
+        if (j > i) j = i; /* guard the extremely rare uniform() rounding up to 1.0 */
+        int tmp = arr[i]; arr[i] = arr[j]; arr[j] = tmp;
+    }
 }
 
 /* ---- df_sort: stable merge sort over a row-index permutation ---- */
@@ -1772,6 +1841,200 @@ DfFloatCol df_cast_to_float(DfDoubleCol col)
     DfFloatCol result;
     result.data  = out;
     result.count = n;
+    return result;
+}
+
+/* ---- public: within-group shuffle (PM-008) ---- */
+
+int *df_shuffle_within_groups(const int *sorted_idx, DfIntCol sorted_key, int n, unsigned seed)
+{
+    if (n < 0) df__error("df_shuffle_within_groups: n must be >= 0");
+    if (n > 0 && !sorted_idx) df__error("df_shuffle_within_groups: sorted_idx is NULL");
+    if (sorted_key.count != n) {
+        char buf[160];
+        snprintf(buf, sizeof(buf),
+                 "df_shuffle_within_groups: sorted_key.count (%d) != n (%d)", sorted_key.count, n);
+        df__error(buf);
+    }
+
+    int *out = (int *)malloc((size_t)(n > 0 ? n : 1) * sizeof(int));
+    if (!out) df__error("df_shuffle_within_groups: allocation failed");
+    if (n > 0) memcpy(out, sorted_idx, (size_t)n * sizeof(int));
+
+    uint64_t rng_state = (uint64_t)seed;
+    (void)df__splitmix64_next(&rng_state);
+
+    int run_start = 0;
+    for (int i = 1; i <= n; i++) {
+        if (i == n || sorted_key.data[i] != sorted_key.data[i - 1]) {
+            df__fisher_yates(out, run_start, i, &rng_state);
+            run_start = i;
+        }
+    }
+
+    return out;
+}
+
+int *df_shuffle_within_groups_string(const int *sorted_idx, DfStrCol sorted_key, int n, unsigned seed)
+{
+    if (n < 0) df__error("df_shuffle_within_groups_string: n must be >= 0");
+    if (n > 0 && !sorted_idx) df__error("df_shuffle_within_groups_string: sorted_idx is NULL");
+    if (sorted_key.count != n) {
+        char buf[160];
+        snprintf(buf, sizeof(buf),
+                 "df_shuffle_within_groups_string: sorted_key.count (%d) != n (%d)", sorted_key.count, n);
+        df__error(buf);
+    }
+
+    int *out = (int *)malloc((size_t)(n > 0 ? n : 1) * sizeof(int));
+    if (!out) df__error("df_shuffle_within_groups_string: allocation failed");
+    if (n > 0) memcpy(out, sorted_idx, (size_t)n * sizeof(int));
+
+    uint64_t rng_state = (uint64_t)seed;
+    (void)df__splitmix64_next(&rng_state);
+
+    int run_start = 0;
+    for (int i = 1; i <= n; i++) {
+        if (i == n || strcmp(sorted_key.data[i], sorted_key.data[i - 1]) != 0) {
+            df__fisher_yates(out, run_start, i, &rng_state);
+            run_start = i;
+        }
+    }
+
+    return out;
+}
+
+/* ---- public: merge-style pairing (PM-008) ---- */
+
+DfPairResult df_pair(const int *demand_idx, DfIntCol demand_key, int n_demand,
+                      const int *supply_idx, DfIntCol supply_key, int n_supply)
+{
+    if (n_demand < 0) df__error("df_pair: n_demand must be >= 0");
+    if (n_supply < 0) df__error("df_pair: n_supply must be >= 0");
+    if (n_demand > 0 && !demand_idx) df__error("df_pair: demand_idx is NULL");
+    if (n_supply > 0 && !supply_idx) df__error("df_pair: supply_idx is NULL");
+    if (demand_key.count != n_demand) {
+        char buf[160];
+        snprintf(buf, sizeof(buf), "df_pair: demand_key.count (%d) != n_demand (%d)",
+                 demand_key.count, n_demand);
+        df__error(buf);
+    }
+    if (supply_key.count != n_supply) {
+        char buf[160];
+        snprintf(buf, sizeof(buf), "df_pair: supply_key.count (%d) != n_supply (%d)",
+                 supply_key.count, n_supply);
+        df__error(buf);
+    }
+
+    size_t cap = (size_t)(n_demand > 0 ? n_demand : 1);
+    int *out_demand   = (int *)malloc(cap * sizeof(int));
+    int *out_supply   = (int *)malloc(cap * sizeof(int));
+    int *out_residual = (int *)malloc(cap * sizeof(int));
+    if (!out_demand || !out_supply || !out_residual) {
+        free(out_demand); free(out_supply); free(out_residual);
+        df__error("df_pair: allocation failed");
+    }
+
+    int matched = 0, residual = 0;
+    int di = 0, si = 0;
+
+    while (di < n_demand) {
+        int d_start = di;
+        int key = demand_key.data[di];
+        while (di < n_demand && demand_key.data[di] == key) di++;
+        int d_len = di - d_start;
+
+        while (si < n_supply && supply_key.data[si] < key) si++;
+
+        int s_start = si;
+        int s_len = 0;
+        if (si < n_supply && supply_key.data[si] == key) {
+            while (si < n_supply && supply_key.data[si] == key) si++;
+            s_len = si - s_start;
+        }
+
+        int take = (d_len < s_len) ? d_len : s_len;
+        for (int k = 0; k < take; k++) {
+            out_demand[matched] = demand_idx[d_start + k];
+            out_supply[matched] = supply_idx[s_start + k];
+            matched++;
+        }
+        for (int k = take; k < d_len; k++)
+            out_residual[residual++] = demand_idx[d_start + k];
+    }
+
+    DfPairResult result;
+    result.demand_idx     = out_demand;
+    result.supply_idx     = out_supply;
+    result.matched_count   = matched;
+    result.residual_idx   = out_residual;
+    result.residual_count = residual;
+    return result;
+}
+
+DfPairResult df_pair_string(const int *demand_idx, DfStrCol demand_key, int n_demand,
+                             const int *supply_idx, DfStrCol supply_key, int n_supply)
+{
+    if (n_demand < 0) df__error("df_pair_string: n_demand must be >= 0");
+    if (n_supply < 0) df__error("df_pair_string: n_supply must be >= 0");
+    if (n_demand > 0 && !demand_idx) df__error("df_pair_string: demand_idx is NULL");
+    if (n_supply > 0 && !supply_idx) df__error("df_pair_string: supply_idx is NULL");
+    if (demand_key.count != n_demand) {
+        char buf[160];
+        snprintf(buf, sizeof(buf), "df_pair_string: demand_key.count (%d) != n_demand (%d)",
+                 demand_key.count, n_demand);
+        df__error(buf);
+    }
+    if (supply_key.count != n_supply) {
+        char buf[160];
+        snprintf(buf, sizeof(buf), "df_pair_string: supply_key.count (%d) != n_supply (%d)",
+                 supply_key.count, n_supply);
+        df__error(buf);
+    }
+
+    size_t cap = (size_t)(n_demand > 0 ? n_demand : 1);
+    int *out_demand   = (int *)malloc(cap * sizeof(int));
+    int *out_supply   = (int *)malloc(cap * sizeof(int));
+    int *out_residual = (int *)malloc(cap * sizeof(int));
+    if (!out_demand || !out_supply || !out_residual) {
+        free(out_demand); free(out_supply); free(out_residual);
+        df__error("df_pair_string: allocation failed");
+    }
+
+    int matched = 0, residual = 0;
+    int di = 0, si = 0;
+
+    while (di < n_demand) {
+        int d_start = di;
+        const char *key = demand_key.data[di];
+        while (di < n_demand && strcmp(demand_key.data[di], key) == 0) di++;
+        int d_len = di - d_start;
+
+        while (si < n_supply && strcmp(supply_key.data[si], key) < 0) si++;
+
+        int s_start = si;
+        int s_len = 0;
+        if (si < n_supply && strcmp(supply_key.data[si], key) == 0) {
+            while (si < n_supply && strcmp(supply_key.data[si], key) == 0) si++;
+            s_len = si - s_start;
+        }
+
+        int take = (d_len < s_len) ? d_len : s_len;
+        for (int k = 0; k < take; k++) {
+            out_demand[matched] = demand_idx[d_start + k];
+            out_supply[matched] = supply_idx[s_start + k];
+            matched++;
+        }
+        for (int k = take; k < d_len; k++)
+            out_residual[residual++] = demand_idx[d_start + k];
+    }
+
+    DfPairResult result;
+    result.demand_idx     = out_demand;
+    result.supply_idx     = out_supply;
+    result.matched_count   = matched;
+    result.residual_idx   = out_residual;
+    result.residual_count = residual;
     return result;
 }
 
